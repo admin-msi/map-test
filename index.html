@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Carte — Données Google Sheets</title>
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- PapaParse (CSV robuste) -->
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+<style>
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
+  #app{display:grid;grid-template-columns:260px 1fr;gap:0;min-height:100vh}
+  #left-buttons{padding:12px;overflow:auto;background:#f7f7fb;border-right:1px solid #eee}
+  #map{height:100vh;width:100%}
+
+  .mini-map{position:relative;height:120px;background:#ddd center/cover no-repeat;border-radius:12px;margin-bottom:12px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.07)}
+  .mini-map.active{outline:3px solid #2f7fff}
+  .mini-map .label{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.6);color:#fff;padding:4px 8px;border-radius:8px;font-size:12px}
+
+  /* Status badge (optional) */
+  #status{position:fixed;right:12px;top:12px;background:#111;color:#fff;padding:6px 10px;border-radius:10px;font-size:12px;opacity:.9;z-index:1000}
+
+  /* Leaflet controls tweaks */
+  .leaflet-control.custom-legend,
+  .leaflet-control.search-toggle { background:#fff;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.15); }
+  .leaflet-control.search-toggle button{
+    border:none;background:transparent;padding:8px 10px;cursor:pointer;display:flex;align-items:center;gap:6px
+  }
+  .leaflet-control.search-toggle button svg{width:18px;height:18px}
+
+  /* Search drawer inside the map */
+  .search-drawer{
+    background:#fff;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.2);
+    padding:10px; width:320px; max-width:calc(100vw - 20px);
+  }
+  .search-row{display:flex;gap:8px;align-items:center}
+  .search-row input{flex:1;padding:8px;border:1px solid #ccc;border-radius:8px}
+  .search-results{max-height:280px;overflow:auto;margin-top:8px;border-top:1px solid #eee;padding-top:8px}
+  .search-item{padding:8px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;background:#fafafa}
+  .search-item strong{display:block;margin-bottom:4px}
+  .search-item .meta{font-size:12px;color:#555}
+  .search-close{background:#111;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="left-buttons"></div>
+  <div id="map"></div>
+</div>
+
+<div id="status">Chargement…</div>
+
+<script>
+// =================== CONFIG ===================
+const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSOaTF3UheWmnHPu3G2PlAXZH3QYm0a06lXkFUpl22oA09_-Gr8kDGrfNsuZ8zbVSbyL89g4hP2e-42/pub?gid=0&single=true&output=csv";
+
+// IMPORTANT: set this from Django. Examples:
+// const IS_ADMIN = {{ request.user.is_staff|yesno:'true,false' }};
+const IS_ADMIN = false; // <--- replace with your Django template flag
+
+let map, allCircles = [], csvRows = [], aggregated = [];
+let speciesIndex = new Map(); // species => array of {lat,lon,City,Country,users:Set}
+const statusEl = document.getElementById('status');
+
+// Regions (same as before)
+const mapPreviewImages = {
+  france: 'https://upload.wikimedia.org/wikipedia/commons/e/e9/France_location_map-Regions_and_departements-2016.svg',
+  reunion: 'https://upload.wikimedia.org/wikipedia/commons/4/45/La_R%C3%A9union_arrondissement_commune_map.svg',
+  martinique: 'https://www.mapsof.net/uploads/static-maps/Martinique_department_location_map.png',
+  guyane: 'https://cdn.prod.website-files.com/5f4e89a1d4b5399eea6e7344/60a3c77594a26122d9f96852_French%20Guiana.png',
+  guadeloupe: 'https://upload.wikimedia.org/wikipedia/commons/1/12/Guadeloupe_department_location_map.svg',
+  mayotte: 'https://upload.wikimedia.org/wikipedia/commons/6/68/Mayotte_blank_map.svg',
+  nouvellecaledonie: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/cb/Nouvelle-Cal%C3%A9donie_collectivity_location_map_centered.svg/2510px-Nouvelle-Cal%C3%A9donie_collectivity_location_map_centered.svg.png',
+  polynesie: 'https://upload.wikimedia.org/wikipedia/commons/4/46/Polyn%C3%A9sie_française_collectivity_location_map.svg'
+};
+const mapConfigs = {
+  france: { name: 'France Métropolitaine', lat: 46.6, lon: 2.2, zoom: 6, bounds: [[41, -5], [51.5, 9]] },
+  reunion: { name: 'La Réunion', lat: -21.1, lon: 55.5, zoom: 9, bounds: [[-21.5, 55.2], [-20.8, 55.8]] },
+  martinique: { name: 'Martinique', lat: 14.6, lon: -61.0, zoom: 9, bounds: [[14.3, -61.3], [14.9, -60.7]] },
+  guyane: { name: 'Guyane', lat: 4.0, lon: -53.0, zoom: 7, bounds: [[2.5, -54.5], [5.7, -51.5]] },
+  guadeloupe: { name: 'Guadeloupe', lat: 16.25, lon: -61.55, zoom: 9, bounds: [[15.8, -61.9], [16.6, -61.2]] },
+  mayotte: { name: 'Mayotte', lat: -12.8, lon: 45.2, zoom: 9, bounds: [[-13.1, 44.9], [-12.5, 45.5]] },
+  nouvellecaledonie: { name: 'Nouvelle-Calédonie', lat: -21.2, lon: 165.5, zoom: 7, bounds: [[-22.5, 164], [-20, 167]] },
+  polynesie: { name: 'Polynésie Française', lat: -17.7, lon: -149.4, zoom: 6, bounds: [[-18.5, -150.5], [-16.5, -148]] }
+};
+
+// =================== LOAD CSV ===================
+async function loadData() {
+  setStatus('Chargement CSV…');
+  const url = `${SHEET_CSV_URL}&_=${Date.now()}`;
+  const resp = await fetch(url, { cache:"no-store" });
+  const csvText = await resp.text();
+  const parsed = Papa.parse(csvText, { header:true, dynamicTyping:false, skipEmptyLines:true });
+
+  csvRows = (parsed.data || []).map(r => ({
+    City: r.City || r.city || r.Ville || r.ville || '',
+    Country: r.Country || r.country || r.Pays || r.pays || '',
+    Department: r['Department/State'] || r.Department || r.State || r.departement || '',
+    Species: r['Species Name'] || r.Species || r.species || '',
+    Username: r.Username || r.User || r.Utilisateur || '',
+    lat: parseFloat(r.Latitude || r.latitude || r.lat),
+    lon: parseFloat(r.Longitude || r.longitude || r.lon)
+  })).filter(r => Number.isFinite(r.lat) && Number.isFinite(r.lon));
+
+  aggregateByLocation();
+  buildSpeciesIndex(csvRows);
+  drawOrUpdateMap('france');
+  setStatus('Données à jour');
+}
+
+// =================== AGGREGATION ===================
+function aggregateByLocation() {
+  const mapObj = new Map();
+  for (const row of csvRows) {
+    const key = `${row.lat.toFixed(6)}|${row.lon.toFixed(6)}`;
+    if (!mapObj.has(key)) {
+      mapObj.set(key, {
+        lat: row.lat, lon: row.lon,
+        City: row.City, Country: row.Country, Department: row.Department,
+        count: 0,
+        speciesUsers: new Map() // species => Set(users)
+      });
+    }
+    const item = mapObj.get(key);
+    item.count += 1;
+
+    if (row.Species) {
+      if (!item.speciesUsers.has(row.Species)) item.speciesUsers.set(row.Species, new Set());
+      if (row.Username) item.speciesUsers.get(row.Species).add(row.Username);
+    }
+  }
+
+  aggregated = Array.from(mapObj.values()).map(it => {
+    const speciesList = [];
+    for (const [sp, usersSet] of it.speciesUsers.entries()) {
+      speciesList.push({ species: sp, users: Array.from(usersSet) });
+    }
+    speciesList.sort((a,b) => b.users.length - a.users.length || a.species.localeCompare(b.species));
+    return { ...it, speciesList };
+  });
+}
+
+// species => array of { lat, lon, City, Country, users:Set }
+function buildSpeciesIndex(rows){
+  speciesIndex = new Map();
+  for (const r of rows) {
+    const sp = (r.Species || "").trim();
+    if (!sp) continue;
+    const key = `${r.lat.toFixed(6)}|${r.lon.toFixed(6)}`;
+    const entry = {
+      lat: r.lat, lon: r.lon,
+      City: r.City, Country: r.Country,
+      users: new Set()
+    };
+    if (!speciesIndex.has(sp)) speciesIndex.set(sp, new Map()); // map by coord key
+    const coordMap = speciesIndex.get(sp);
+    if (!coordMap.has(key)) coordMap.set(key, entry);
+    if (r.Username) coordMap.get(key).users.add(r.Username);
+  }
+}
+
+// =================== MAP + CONTROLS ===================
+function drawOrUpdateMap(regionKey) {
+  if (map) map.remove();
+  const cfg = mapConfigs[regionKey];
+  map = L.map('map', { minZoom: 5, maxZoom: 18, maxBounds: cfg.bounds, maxBoundsViscosity: 1.0 })
+        .setView([cfg.lat, cfg.lon], cfg.zoom);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
+
+  buildMiniMaps(regionKey);
+  addLegendControl();
+  addSearchControl(); // magnifier button + drawer
+  drawPoints();
+}
+
+// markers
+function drawPoints() {
+  allCircles.forEach(c => c.remove());
+  allCircles = [];
+
+  for (const row of aggregated) {
+    const { lat, lon, count, City, Country, speciesList } = row;
+
+    // DARK palette
+    let color = "#440154", radius = 6;
+    if (count >= 50000) { color = "#ff0000"; radius = 40; }
+    else if (count >= 10000) { color = "#fde725"; radius = 30; }
+    else if (count >= 1000) { color = "#5ec962"; radius = 20; }
+    else if (count >= 100) { color = "#21918c"; radius = 12; }
+    else if (count >= 10) { color = "#3b528b"; radius = 8; }
+
+    // popup content (users visible only to admin)
+    const speciesLines = speciesList.length
+      ? speciesList.map(su => {
+          const usersTxt = IS_ADMIN && su.users.length ? ` — <small>${su.users.map(escapeHtml).join(", ")}</small>` : '';
+          return `• <i>${escapeHtml(su.species)}</i>${usersTxt}`;
+        }).join("<br>")
+      : '';
+
+    const popup = `
+      <strong>${escapeHtml(City || 'Inconnu')}</strong> — ${escapeHtml(Country || '')}
+      <br><b>${count}</b> enregistrements
+      ${speciesLines ? `<br><b>Espèces</b><br>${speciesLines}` : ''}
+    `;
+
+    const circle = L.circleMarker([lat, lon], {
+      radius, fillColor: color, color, weight: 1, opacity: 1, fillOpacity: 0.85
+    }).bindPopup(popup);
+
+    circle.addTo(map);
+    allCircles.push(circle);
+  }
+}
+
+// Legend inside the map
+function addLegendControl(){
+  const legend = L.control({position:'bottomright'});
+  legend.onAdd = function(){
+    const div = L.DomUtil.create('div','custom-legend');
+    div.style.padding = '10px';
+    div.style.borderRadius = '8px';
+    div.innerHTML = `
+      <div style="font-weight:600;margin-bottom:6px">Légende (nb d'entrées)</div>
+      <div style="display:flex;align-items:center;gap:8px"><i style="display:inline-block;width:16px;height:16px;background:#440154;border:1px solid #333;border-radius:4px"></i> 0 - 9</div>
+      <div style="display:flex;align-items:center;gap:8px"><i style="display:inline-block;width:16px;height:16px;background:#3b528b;border:1px solid #333;border-radius:4px"></i> 10 - 99</div>
+      <div style="display:flex;align-items:center;gap:8px"><i style="display:inline-block;width:16px;height:16px;background:#21918c;border:1px solid #333;border-radius:4px"></i> 100 - 999</div>
+      <div style="display:flex;align-items:center;gap:8px"><i style="display:inline-block;width:16px;height:16px;background:#5ec962;border:1px solid #333;border-radius:4px"></i> 1 000 - 9 999</div>
+      <div style="display:flex;align-items:center;gap:8px"><i style="display:inline-block;width:16px;height:16px;background:#fde725;border:1px solid #333;border-radius:4px"></i> 10 000 - 49 999</div>
+      <div style="display:flex;align-items:center;gap:8px"><i style="display:inline-block;width:16px;height:16px;background:#ff0000;border:1px solid #333;border-radius:4px"></i> 50 000+</div>
+    `;
+    return div;
+  };
+  legend.addTo(map);
+}
+
+// Magnifier control + drawer
+let searchDrawer = null;
+function addSearchControl(){
+  const SearchCtl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd: function(){
+      const container = L.DomUtil.create('div','search-toggle');
+      const btn = L.DomUtil.create('button','',container);
+      btn.title = 'Rechercher une espèce';
+      btn.innerHTML = `
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19 15.5 14zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"></path></svg>
+        <span style="font-weight:600;">Rechercher</span>
+      `;
+      L.DomEvent.on(btn, 'click', (e)=> {
+        L.DomEvent.stopPropagation(e);
+        L.DomEvent.preventDefault(e);
+        toggleSearchDrawer();
+      });
+      return container;
+    }
+  });
+  map.addControl(new SearchCtl());
+}
+
+function toggleSearchDrawer(){
+  if (searchDrawer) {
+    map.removeControl(searchDrawer);
+    searchDrawer = null;
+    return;
+  }
+  searchDrawer = L.control({position:'topright'});
+  searchDrawer.onAdd = function(){
+    const div = L.DomUtil.create('div','search-drawer');
+    div.innerHTML = `
+      <div class="search-row">
+        <input id="speciesInput" placeholder="Tapez une espèce…" />
+        <button class="search-close" id="speciesClose">Fermer</button>
+      </div>
+      <div class="search-results" id="speciesResults"></div>
+    `;
+    // prevent map dragging while interacting
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  };
+  searchDrawer.addTo(map);
+
+  const input = document.getElementById('speciesInput');
+  const results = document.getElementById('speciesResults');
+  const closeBtn = document.getElementById('speciesClose');
+
+  closeBtn.addEventListener('click', toggleSearchDrawer);
+  input.addEventListener('input', debounce(()=>{
+    renderSpeciesSearch(input.value.trim(), results);
+  }, 150));
+  input.focus();
+}
+
+function renderSpeciesSearch(q, container){
+  container.innerHTML = '';
+  if (!q) return;
+  const ql = q.toLowerCase();
+
+  // match species by substring
+  const matches = Array.from(speciesIndex.keys())
+    .filter(sp => sp.toLowerCase().includes(ql))
+    .sort((a,b)=>a.localeCompare(b))
+    .slice(0, 100); // safety cap
+
+  if (!matches.length) {
+    container.innerHTML = `<div class="meta">Aucun résultat.</div>`;
+    return;
+  }
+
+  for (const sp of matches) {
+    const coordMap = speciesIndex.get(sp); // Map of coordKey -> {City,Country,users}
+    // City list (one per coord)
+    const items = Array.from(coordMap.values()).map(entry => {
+      const city = entry.City || 'Inconnu';
+      const country = entry.Country || '';
+      const users = Array.from(entry.users);
+      const usersHtml = IS_ADMIN && users.length
+        ? `<div class="meta"><b>Utilisateurs:</b> ${users.map(escapeHtml).join(', ')}</div>`
+        : '';
+      return `
+        <div class="search-item" data-lat="${entry.lat}" data-lon="${entry.lon}">
+          <strong>${escapeHtml(city)}</strong> — ${escapeHtml(country)}
+          ${usersHtml}
+        </div>
+      `;
+    }).join('');
+
+    const block = document.createElement('div');
+    block.innerHTML = `
+      <div style="font-weight:700;margin:8px 0 6px 0">${escapeHtml(sp)}</div>
+      ${items}
+    `;
+    container.appendChild(block);
+  }
+
+  // click to fly / open popup
+  container.querySelectorAll('.search-item').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const lat = parseFloat(el.getAttribute('data-lat'));
+      const lon = parseFloat(el.getAttribute('data-lon'));
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        map.setView([lat, lon], 10, { animate: true });
+        // open popup if available
+        const marker = allCircles.find(m=>{
+          const c = m.getLatLng();
+          return Math.abs(c.lat-lat)<1e-6 && Math.abs(c.lng-lon)<1e-6;
+        });
+        if (marker) marker.openPopup();
+      }
+    });
+  });
+}
+
+// =================== UI HELPERS ===================
+function buildMiniMaps(active) {
+  const left = document.getElementById('left-buttons');
+  left.innerHTML = '';
+  Object.keys(mapConfigs).forEach((key) => {
+    const div = document.createElement('div');
+    div.className = 'mini-map' + (key === active ? ' active' : '');
+    div.style.backgroundImage = `url('${mapPreviewImages[key]}')`;
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.innerText = mapConfigs[key].name;
+    div.appendChild(label);
+    div.addEventListener('click', () => drawOrUpdateMap(key));
+    left.appendChild(div);
+  });
+}
+
+function setStatus(msg){ if(statusEl){ statusEl.textContent = msg; } }
+function escapeHtml(s){ return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
+function debounce(fn, wait){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), wait); }; }
+
+// =================== INIT ===================
+(async function init(){
+  drawOrUpdateMap('france');
+  await loadData();
+  setInterval(loadData, 5 * 60 * 1000); // refresh 5 min
+})();
+</script>
+</body>
+</html>
